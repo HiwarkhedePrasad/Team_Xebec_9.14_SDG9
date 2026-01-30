@@ -1,0 +1,30 @@
+# LangGraph Drone Fleet Backend Dependencies
+# Team Xebec 9.14 - SDG9
+
+# Core LangGraph/LangChain
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+
+# LLM Providers (uncomment the one you need)
+langchain-openai>=0.2.0
+# langchain-anthropic>=0.2.0
+# langchain-google-genai>=2.0.0
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-socketio>=5.11.0
+
+# Utilities
+pydantic>=2.0
+numpy>=1.24.0
+noise>=1.2.2
+
+# AirSim (optional, only needed for simulation)
+# msgpack-rpc-python
+# airsim
+
+# Development
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

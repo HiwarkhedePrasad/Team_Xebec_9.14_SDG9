@@ -75,7 +75,7 @@ h2 {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
-  background: #1e293b; /* Solid dark background to hide outside map */
+  background: #ffffff; /* Solid white background for white theme */
   cursor: grab;
   user-select: none;
 }

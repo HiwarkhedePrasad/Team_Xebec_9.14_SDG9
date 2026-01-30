@@ -9,6 +9,7 @@ export default function App() {
     flood: true,
     earthquake: true,
     humans: true,
+    drones: true,
   });
 
   useEffect(() => {
@@ -26,7 +27,7 @@ export default function App() {
 
   return (
     <div>
-      <h2>🌍 Disaster Zone – 50km × 50km</h2>
+      <h2>🌍 Disaster Zone – 5km × 5km</h2>
 
       <div className="controls">
         {Object.keys(layers).map((layerName) => (
@@ -41,6 +42,7 @@ export default function App() {
               {layerName === "terrain" ? "🗺️ " : ""}
               {layerName === "flood" ? "🌊 " : ""}
               {layerName === "earthquake" ? "⚡ " : ""}
+              {layerName === "drones" ? "🚁 " : ""}
               {layerName}
             </span>
           </label>
