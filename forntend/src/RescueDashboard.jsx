@@ -58,6 +58,29 @@ export default function RescueDashboard({ survivors, drones, alerts }) {
             </div>
           )}
         </div>
+        
+        {/* Drone Fleet Status */}
+        <div className="drone-fleet-status">
+          <h3>🚁 Drone Fleet</h3>
+          <div className="drone-list">
+            {drones.map(drone => (
+              <div key={drone.id} className="drone-item">
+                <div className="drone-info">
+                  <span className="drone-name">{drone.name}</span>
+                  <span className={`drone-status status-${drone.status}`}>{drone.status}</span>
+                </div>
+                <div className="battery-container">
+                  <div 
+                    className={`battery-bar ${drone.battery < 0.2 ? 'low' : drone.battery < 0.5 ? 'medium' : 'high'}`}
+                    style={{ width: `${Math.round(drone.battery * 100)}%` }}
+                  />
+                  <span className="battery-text">{Math.round(drone.battery * 100)}%</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
 
         {/* Recent Alerts */}
         <div className="alert-feed">

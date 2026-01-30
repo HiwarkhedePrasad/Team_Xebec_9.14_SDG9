@@ -745,6 +745,107 @@ h2 {
   
   .stats-bar {
     flex-wrap: wrap;
-    gap: 20px;
+  gap: 20px;
   }
+}
+
+/* Command Center Layout */
+.command-layout {
+  display: flex;
+  height: 100vh;
+  padding-top: 60px; /* Offset for header */
+}
+
+.command-map {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  border-right: 1px solid #e2e8f0;
+}
+
+/* Fix full screen map view */
+.full-screen-map {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 10;
+}
+
+/* Drone Fleet Status Styles */
+.drone-fleet-status {
+  margin-top: 20px;
+  background: rgba(30, 41, 59, 0.4);
+  padding: 15px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+}
+
+.drone-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.drone-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  background: rgba(15, 23, 42, 0.6);
+  border-radius: 6px;
+}
+
+.drone-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.drone-name {
+  font-weight: 500;
+  color: #e2e8f0;
+}
+
+.drone-status {
+  font-size: 0.8em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+.status-idle { background: #475569; color: #cbd5e1; }
+.status-scanning { background: #0ea5e9; color: white; }
+.status-responding { background: #e11d48; color: white; }
+.status-returning { background: #f59e0b; color: white; }
+.status-charging { background: #22c55e; color: white; }
+
+.battery-container {
+  position: relative;
+  height: 8px;
+  background: #334155;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.battery-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s ease, background-color 0.3s ease;
+}
+
+.battery-bar.high { background: #22c55e; }
+.battery-bar.medium { background: #f59e0b; }
+.battery-bar.low { background: #ef4444; }
+
+.battery-text {
+  position: absolute;
+  right: 0;
+  top: -16px;
+  font-size: 0.75em;
+  color: #94a3b8;
 }

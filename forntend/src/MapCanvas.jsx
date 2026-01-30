@@ -4,8 +4,20 @@ import React, { useRef, useEffect, useCallback, useMemo, useState } from "react"
 const CANVAS_SIZE = 2000;
 const GRID_SIZE = 30;
 
-const MapCanvas = ({ map, layers, liveDrones = [], scannedCells = null, survivors = [], onMapClick, selectedDroneId }) => {
+const MapCanvas = ({ 
+  map, 
+  layers, 
+  liveDrones = [], 
+  scannedCells = null, 
+  survivors = [], 
+  heatSignatures = [], // Received from parent
+  onMapClick, 
+  selectedDroneId,
+  style = {}, // Allow custom styles
+  className = "" 
+}) => {
   const canvasRef = useRef(null);
+  const containerRef = useRef(null); // Ref for the outer div
   const animationRef = useRef(null);
   const dronePositions = useRef({});
   const [viewOffset, setViewOffset] = useState({ x: 0, y: 0 });
@@ -91,6 +103,34 @@ const MapCanvas = ({ map, layers, liveDrones = [], scannedCells = null, survivor
       if (layers.drones) {
         const drones = liveDrones.length > 0 ? liveDrones : [];
         const mapScale = CANVAS_SIZE / 15000;
+        
+        // Render Heat Signatures (Persistent from Backend)
+        // Only if layer is active and area is scanned
+        if (layers.humans && heatSignatures) {
+           heatSignatures.forEach(sig => {
+             // Check visibility
+             const sigGridX = Math.floor(sig.x / 500); // 500 is grid cell size
+             const sigGridY = Math.floor(sig.y / 500);
+             
+             // Check if scanned (or if fog is off)
+             const isVisible = !layers.fog || (scannedCells && scannedCells[sigGridY] && scannedCells[sigGridY][sigGridX]);
+             
+             if (isVisible) {
+               const sx = sig.x * mapScale;
+               const sy = sig.y * mapScale;
+               const sSize = sig.size * mapScale;
+               
+               const gradient = ctx.createRadialGradient(sx, sy, 0, sx, sy, sSize);
+               gradient.addColorStop(0, `rgba(255, 100, 50, ${sig.intensity * 0.8})`);
+               gradient.addColorStop(1, "rgba(255, 0, 0, 0)");
+               
+               ctx.fillStyle = gradient;
+               ctx.beginPath();
+               ctx.arc(sx, sy, sSize, 0, Math.PI * 2);
+               ctx.fill();
+             }
+           });
+        }
 
         drones.forEach((drone) => {
           // Scale position
@@ -218,7 +258,7 @@ const MapCanvas = ({ map, layers, liveDrones = [], scannedCells = null, survivor
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [map, layers, liveDrones, scannedCells, survivors, viewOffset, zoom, getTerrainColor]);
+  }, [map, layers, liveDrones, scannedCells, survivors, heatSignatures, viewOffset, zoom, getTerrainColor]);
 
   // Mouse handlers for pan
   const handleMouseDown = (e) => {
@@ -238,40 +278,62 @@ const MapCanvas = ({ map, layers, liveDrones = [], scannedCells = null, survivor
     isDragging.current = false;
   };
 
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    setZoom(prev => Math.max(0.3, Math.min(3, prev * delta)));
-  };
+  // Add non-passive event listener for wheel to prevent browser zoom
+  useEffect(() => {
+    const canvas = containerRef.current;
+    if (!canvas) return;
+
+    const onWheel = (e) => {
+      // Prevent browser zoom (ctrl+wheel) and back/forward swipe
+      e.preventDefault();
+      
+      const panSpeed = 1.0;
+      setViewOffset(prev => ({ 
+        x: prev.x - e.deltaX * panSpeed, 
+        y: prev.y - e.deltaY * panSpeed 
+      }));
+    };
+
+    // Use passive: false to allow preventDefault()
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+
+    return () => {
+      canvas.removeEventListener('wheel', onWheel);
+    };
+  }, []);
 
   return (
-    <div style={{ 
-      width: "100vw", 
-      height: "100vh", 
-      overflow: "hidden",
-      background: "#1e293b",
-      position: "fixed",
-      top: 0,
-      left: 0,
-    }}>
+    <div 
+      ref={containerRef}
+      className={className}
+      style={{ 
+        width: "100%", 
+        height: "100%", 
+        overflow: "hidden",
+        background: "#1e293b",
+        position: "relative", // Default to relative to fill parent
+        touchAction: "none", // Prevent touch gestures
+        ...style 
+      }}
+    >
       <canvas
         ref={canvasRef}
         width={CANVAS_SIZE}
         height={CANVAS_SIZE}
         style={{
           cursor: isDragging.current ? "grabbing" : "grab",
-          marginTop: "60px",
+          // Removed fixed marginTop
         }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
+        onClick={handleCanvasClick}
       />
       
       {/* Simple zoom controls */}
       <div style={{
-        position: "fixed",
+        position: "absolute",
         bottom: 20,
         right: 20,
         display: "flex",

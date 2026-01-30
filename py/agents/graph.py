@@ -14,6 +14,7 @@ from datetime import datetime
 from langgraph.graph import StateGraph, END
 
 from .state import DroneFleetState, DroneInfo, SurvivorLocation, Mission, Alert, HeatSignature
+from .pathfinding import a_star_search
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ def create_initial_state() -> DroneFleetState:
     return {
         "drones": drones,
         "missions": [],
-        "survivors": [],
+        "survivors_detected": [],
         "alerts": [],
         "tick": 0,
         "scanned_cells": scanned,
@@ -128,6 +129,7 @@ def analyze_situation(state: DroneFleetState) -> dict:
         "situation_analysis": analysis,
         "next_action": next_action,
         "tick": state["tick"] + 1,
+        "alerts": [],  # Clear alerts from previous tick
     }
 
 
@@ -147,14 +149,44 @@ def dispatch_scan_missions(state: DroneFleetState) -> dict:
                 world_x = cx * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
                 world_y = cy * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
                 unexplored.append((world_x, world_y))
+            else:
+                pass # We handle re-scans below
+
+    # Check for 100% completion for logging (but don't stop)
+    total_cells = GRID_SIZE * GRID_SIZE
+    if len(scanned) == total_cells and not getattr(dispatch_scan_missions, "logged_complete", False):
+        logger.info("🎉 Map fully explored! Switching to patrol mode (15% re-scan).")
+        dispatch_scan_missions.logged_complete = True
     
-    # If all explored, we're done!
+    # REDUNDANCY LOGIC:
+    # Add back 15% of already scanned cells to "unexplored" pool to force re-visiting
+    # This ensures that if a survivor was missed, another drone might find them.
+    if scanned:
+        # Convert scanned set back to world coordinates lists
+        scanned_list = list(scanned)
+        num_rescan = int(len(scanned_list) * 0.15)
+        rescan_cells = random.sample(scanned_list, num_rescan)
+        
+        for cx, cy in rescan_cells:
+            world_x = cx * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+            world_y = cy * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+            unexplored.append((world_x, world_y))
+
     if not unexplored:
-        logger.info("🎉 Map fully explored!")
+        # Should rarely happen with re-scan logic
         return {"drones": drones, "missions": missions, "alerts": alerts}
     
     # Shuffle unexplored to distribute drones
     random.shuffle(unexplored)
+    
+    # Memory Cleanup: Remove completed missions older than 100 ticks
+    # Or just keep active ones + last 10 completed?
+    # Simple cleanup: keep only active missions
+    active_missions = [m for m in missions if m.status != "completed"]
+    # If we want to keep some history, ok, but for now strict cleanup to prevent leak
+    missions = active_missions
+    
+    # Find drones that can be assigned (idle or scanning without mission)
     
     # Find drones that can be assigned (idle or scanning without mission)
     # Filter out MANUAL drones
@@ -205,6 +237,14 @@ def dispatch_scan_missions(state: DroneFleetState) -> dict:
             ))
             unexplored.remove(nearest)
             
+            # Generate A* path
+            path = a_star_search(
+                start=(drone.x, drone.y),
+                goal=(nearest[0], nearest[1]),
+                grid_size=GRID_SIZE,
+                cell_size=GRID_CELL_SIZE
+            )
+            
             mission = Mission(
                 id=f"explore_{drone.id}_{state['tick']}",
                 drone_id=drone.id,
@@ -221,10 +261,10 @@ def dispatch_scan_missions(state: DroneFleetState) -> dict:
                 x=drone.x, y=drone.y, z=drone.z,
                 status="scanning", battery=drone.battery,
                 current_mission=mission.id, control_mode=drone.control_mode,
-                waypoints=drone.waypoints, waypoint_index=drone.waypoint_index
+                waypoints=path, waypoint_index=1  # Start from index 1 (skipping start pos)
             )
             
-            logger.info(f"📡 {drone.name} → explore ({nearest[0]}, {nearest[1]})")
+            logger.info(f"📡 {drone.name} → explore ({nearest[0]}, {nearest[1]}) via A*")
         
         updated_drones.append(drone)
     
@@ -277,7 +317,16 @@ def respond_to_survivors(state: DroneFleetState) -> dict:
         missions.append(mission)
         
         # Update drone
+        # Generate A* path to survivor
+        path = a_star_search(
+            start=(nearest.x, nearest.y),
+            goal=(survivor.x, survivor.y),
+            grid_size=GRID_SIZE,
+            cell_size=GRID_CELL_SIZE
+        )
+
         idx = next(i for i, d in enumerate(drones) if d.id == nearest.id)
+
         drones[idx] = DroneInfo(
             id=nearest.id,
             name=nearest.name,
@@ -288,8 +337,8 @@ def respond_to_survivors(state: DroneFleetState) -> dict:
             battery=nearest.battery,
             current_mission=mission.id,
             control_mode=nearest.control_mode,
-            waypoints=nearest.waypoints,
-            waypoint_index=nearest.waypoint_index,
+            waypoints=path,
+            waypoint_index=1,
         )
         
         # Mark survivor as being rescued
@@ -330,13 +379,28 @@ def coordinate_fleet(state: DroneFleetState) -> dict:
                 id=f"return_{drone.id}_{state['tick']}",
                 drone_id=drone.id,
                 mission_type="return",
-                target_x=7500,
-                target_y=7500,
+                target_x=500,
+                target_y=500,
                 target_z=-10,
                 status="active",
             )
             missions.append(mission)
             
+            # Generate A* path to base (7500, 7500)
+            # Or arguably base is at 500, 500? In create_initial_state base is 500,500.
+            # But here target was 7500,7500? That's the center.
+            # Let's trust the existing target_x/y (7500,7500) or change to base?
+            # Existing code said target_x=7500... maybe it meant center?
+            # Let's stick to the target defined in mission.
+            
+            # Generate A* path to base (500, 500)
+            path = a_star_search(
+                start=(drone.x, drone.y),
+                goal=(500, 500),
+                grid_size=GRID_SIZE,
+                cell_size=GRID_CELL_SIZE
+            )
+
             drone = DroneInfo(
                 id=drone.id,
                 name=drone.name,
@@ -347,8 +411,8 @@ def coordinate_fleet(state: DroneFleetState) -> dict:
                 battery=drone.battery,
                 current_mission=mission.id,
                 control_mode=drone.control_mode,
-                waypoints=drone.waypoints,
-                waypoint_index=drone.waypoint_index,
+                waypoints=path,
+                waypoint_index=1,
             )
             
             alerts.append(Alert(
@@ -375,7 +439,7 @@ def update_positions(state: DroneFleetState) -> dict:
     new_scanned_cells = []
     updated_drones = []
     
-    SPEED = 200  # Units per tick (approx 66 m/s)
+    SPEED = 300  # Units per tick (Fast simulation)
     
     for drone in drones:
         new_x, new_y = drone.x, drone.y
@@ -399,61 +463,106 @@ def update_positions(state: DroneFleetState) -> dict:
             if control_mode == "manual":
                 current_mission = None
         
+        
         # 2. Movement Logic
-        if control_mode == "manual":
-            # Manual Control: Follow waypoints
-            if waypoints and waypoint_index < len(waypoints):
-                target_x, target_y = waypoints[waypoint_index]
+        # 2. Movement Logic - Unified (Auto + Manual both follow waypoints if available)
+        
+        # Separation Force (Collision Avoidance)
+        sep_x, sep_y = 0.0, 0.0
+        MIN_DIST = 1500.0  # Safe distance between drones (3 grid cells)
+        
+        for other in drones:
+            if other.id != drone.id:
+                dist_sq = (drone.x - other.x)**2 + (drone.y - other.y)**2
+                if dist_sq < MIN_DIST**2:
+                    if dist_sq == 0:
+                        # Perfect overlap! Random repulsion
+                        sep_x += random.uniform(-1, 1) * SPEED
+                        sep_y += random.uniform(-1, 1) * SPEED
+                    else:
+                        dist = math.sqrt(dist_sq)
+                        # Repulsion vector component
+                        # Force is inversely proportional to distance (closer = stronger)
+                        strength = (MIN_DIST - dist) / MIN_DIST
+                        # Stronger repulsion: 1.5x SPEED at max strength
+                        sep_x += ((drone.x - other.x) / dist) * strength * (SPEED * 1.5)
+                        sep_y += ((drone.y - other.y) / dist) * strength * (SPEED * 1.5)
+
+        # Check if we have a valid path to follow
+        if waypoints and waypoint_index < len(waypoints):
+            # Follow the path (A* or Manual)
+            target_x, target_y = waypoints[waypoint_index]
+            
+            dx = target_x - drone.x
+            dy = target_y - drone.y
+            dist = math.sqrt(dx*dx + dy*dy)
+            
+            if dist < SPEED:
+                # Arrived at waypoint
+                new_x, new_y = target_x, target_y
+                waypoint_index += 1
                 
-                dx = target_x - drone.x
-                dy = target_y - drone.y
+                # If we reached the end of the path
+                if waypoint_index >= len(waypoints):
+                    if control_mode == "manual":
+                        new_status = "idle"
+                    elif current_mission:
+                        # Mission complete logic
+                        mission = next((m for m in missions if m.id == current_mission), None)
+                        if mission:
+                            mission.status = "completed"
+                            new_status = "scanning" if mission.mission_type == "scan" else "idle"
+                            if mission.mission_type == "return":
+                                new_status = "idle" # Back to action!
+                                new_battery = 1.0   # Instant swap/recharge
+                                logger.info(f"🔋 {drone.name} recharged at base")
+                            
+                            current_mission = None
+            else:
+                # Move towards waypoint
+                new_status = "active" if control_mode == "manual" else drone.status # Keep status if auto (e.g. scanning/returning)
+                new_x = drone.x + (dx / dist) * SPEED + sep_x
+                new_y = drone.y + (dy / dist) * SPEED + sep_y
+             
+             # Keep within bounds
+            new_x = max(0, min(15000, new_x))
+            new_y = max(0, min(15000, new_y))
+            
+            # Drain battery
+            new_battery = max(0, new_battery - 0.0005)
+            
+        elif control_mode == "auto" and current_mission:
+             # Fallback for Auto without waypoints (shouldn't happen with A*)
+             # But keeping purely for safety
+            mission = next((m for m in missions if m.id == drone.current_mission), None)
+            if mission and mission.status == "active":
+                dx = mission.target_x - drone.x
+                dy = mission.target_y - drone.y
                 dist = math.sqrt(dx*dx + dy*dy)
                 
                 if dist < SPEED:
-                    # Arrived at waypoint
-                    new_x, new_y = target_x, target_y
-                    waypoint_index += 1
-                    
-                    if waypoint_index >= len(waypoints):
-                        # End of path
-                        new_status = "idle"
+                    new_x, new_y = mission.target_x, mission.target_y
+                    mission.status = "completed"
+                    new_status = "scanning" if mission.mission_type == "scan" else "idle"
+                    if mission.mission_type == "return":
+                            new_status = "idle" # Back to action!
+                            new_battery = 1.0   # Instant swap/recharge
+                            logger.info(f"🔋 {drone.name} recharged at base")
+                    current_mission = None
                 else:
-                    # Move towards waypoint
-                    new_status = "active"
-                    new_x = drone.x + (dx / dist) * SPEED
-                    new_y = drone.y + (dy / dist) * SPEED
-            else:
-                new_status = "idle"
+                    new_x = drone.x + (dx / dist) * SPEED + sep_x
+                    new_y = drone.y + (dy / dist) * SPEED + sep_y
                 
-        else:
-            # Auto Logic: Follow Missions
-            if drone.current_mission:
-                # Find the mission
-                mission = next((m for m in missions if m.id == drone.current_mission), None)
-                if mission and mission.status == "active":
-                    # Calculate direction
-                    dx = mission.target_x - drone.x
-                    dy = mission.target_y - drone.y
-                    dist = math.sqrt(dx*dx + dy*dy)
-                    
-                    if dist < SPEED:
-                        # Arrived at destination
-                        new_x, new_y = mission.target_x, mission.target_y
-                        mission.status = "completed"
-                        
-                        # Reset to idle (or scanning at destination)
-                        new_status = "scanning" if mission.mission_type == "scan" else "idle"
-                        if mission.mission_type == "return":
-                            new_status = "charging"
-                            new_battery = min(1.0, new_battery + 0.1)  # Recharge
-                        current_mission = None
-                    else:
-                        # Move towards target
-                        new_x = drone.x + (dx / dist) * SPEED
-                        new_y = drone.y + (dy / dist) * SPEED
-                    
-                    # Drain battery slightly
-                    new_battery = max(0, new_battery - 0.003)
+                # Keep within bounds
+                new_x = max(0, min(15000, new_x))
+                new_y = max(0, min(15000, new_y))
+                
+                new_battery = max(0, new_battery - 0.0005)
+        
+        # Deadlock Fix: If scanning and no mission, switch to idle so we can get a new mission
+        # This handles the transition from "arrived" -> "ready for next"
+        if new_status == "scanning" and not current_mission and control_mode == "auto":
+            new_status = "idle"
         
         # Track cells scanned by this drone (fog of war reveal)
         cell_x = int(new_x // GRID_CELL_SIZE)
@@ -480,9 +589,14 @@ def update_positions(state: DroneFleetState) -> dict:
             waypoint_index=waypoint_index,
         ))
     
+    # Deduplicate scanned cells
+    # We must merge existing scanned + new scanned and remove duplicates
+    all_scanned = set(state.get("scanned_cells", []))
+    all_scanned.update(new_scanned_cells)
+    
     return {
         "drones": updated_drones,
-        "scanned_cells": new_scanned_cells,
+        "scanned_cells": list(all_scanned),
     }
 
 
@@ -494,8 +608,9 @@ def simulate_detections(state: DroneFleetState) -> dict:
     
     for drone in drones:
         if drone.status == "scanning":
-            # 12% chance of detection per tick
-            if random.random() < 0.12:
+
+            # 0.5% chance of detection per tick (reduced from 12% to prevent overflow)
+            if random.random() < 0.005:
                 survivor = SurvivorLocation(
                     id=f"survivor_{uuid.uuid4().hex[:6]}",
                     x=drone.x + random.uniform(-300, 300),
@@ -513,16 +628,19 @@ def simulate_detections(state: DroneFleetState) -> dict:
                 
                 logger.info(f"🔥 {drone.name} found survivor at ({survivor.x:.0f}, {survivor.y:.0f})")
     
+    # Merge with existing survivors
+    all_survivors = list(state["survivors_detected"])
+    all_survivors.extend(new_survivors)
+    
     return {
-        "survivors_detected": new_survivors,
+        "survivors_detected": all_survivors,
         "alerts": alerts,
     }
 
 
 def should_continue(state: DroneFleetState) -> Literal["continue", "end"]:
     """Check if we should continue the simulation."""
-    if state["tick"] >= 1000:  # Limit for safety
-        return "end"
+    # Run forever (no tick limit)
     return "continue"
 
 
@@ -551,7 +669,7 @@ def create_drone_fleet_agent():
     graph.add_node("dispatch_scan", dispatch_scan_missions)
     graph.add_node("respond_survivors", respond_to_survivors)
     graph.add_node("coordinate_fleet", coordinate_fleet)
-    graph.add_node("update_positions", update_drone_positions)
+    graph.add_node("update_positions", update_positions)
     graph.add_node("simulate", simulate_detections)
     
     # Entry point

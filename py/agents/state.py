@@ -6,7 +6,7 @@ Defines the typed state that flows through the agent graph.
 from typing import TypedDict, Literal, Annotated
 from dataclasses import dataclass, field
 from datetime import datetime
-import operator
+# import operator # No longer used for reducers
 
 
 @dataclass
@@ -129,17 +129,17 @@ class DroneFleetState(TypedDict):
     drones: list[DroneInfo]
     
     # Detections
-    survivors: Annotated[list[SurvivorLocation], operator.add]
+    survivors_detected: list[SurvivorLocation]
     
     # Active missions
     missions: list[Mission]
     
     # Alerts to emit
-    alerts: Annotated[list[Alert], operator.add]
+    alerts: list[Alert]
     
     # Scanned/explored cells (grid coordinates that drones have visited)
     # Each cell is a tuple (grid_x, grid_y) where grid is 30x30 (500 units per cell)
-    scanned_cells: Annotated[list[tuple[int, int]], operator.add]
+    scanned_cells: list[tuple[int, int]]
     
     # Current analysis from the AI
     situation_analysis: str

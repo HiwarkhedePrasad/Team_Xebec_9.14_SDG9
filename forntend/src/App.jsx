@@ -27,6 +27,7 @@ export default function App() {
   const [map, setMap] = useState(null);
   const [drones, setDrones] = useState([]);
   const [survivors, setSurvivors] = useState([]);
+  const [heatSignatures, setHeatSignatures] = useState([]);  // Persistent heat signatures
   const [alerts, setAlerts] = useState([]);
   const [connected, setConnected] = useState(false);
   const [activeTab, setActiveTab] = useState("map");
@@ -63,6 +64,9 @@ export default function App() {
       if (data.drones) {
         setDrones(data.drones);
       }
+      if (data.heat_signatures) {
+        setHeatSignatures(data.heat_signatures);
+      }
     }, 100);
 
     socket.on("connect", () => {
@@ -73,6 +77,7 @@ export default function App() {
       setDrones([]);
       setSurvivors([]);
       setAlerts([]);
+      setHeatSignatures([]);
       setScannedCells(
         Array(GRID_SIZE).fill(null).map(() => Array(GRID_SIZE).fill(false))
       );
@@ -309,6 +314,8 @@ export default function App() {
             liveDrones={drones}
             scannedCells={scannedCells}
             survivors={survivors}
+            heatSignatures={heatSignatures}
+            className="full-screen-map"
           />
         </>
       )}

@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
     agent_task = asyncio.create_task(
         run_agent_loop(
             emit_callback=emit_to_clients,
-            tick_interval=3.0,  # Update every 3 seconds
+            tick_interval=0.1,  # Update every 0.1 seconds (10Hz)
         )
     )
     
@@ -148,7 +148,7 @@ async def connect(sid, environ):
     agent_task = asyncio.create_task(
         run_agent_loop(
             emit_callback=emit_to_clients,
-            tick_interval=3.0,
+            tick_interval=0.1,
         )
     )
     logger.info("✅ Fresh simulation started")
@@ -195,7 +195,7 @@ async def reset_simulation(sid, data=None):
     agent_task = asyncio.create_task(
         run_agent_loop(
             emit_callback=emit_to_clients,
-            tick_interval=3.0,
+            tick_interval=0.1,
         )
     )
     
