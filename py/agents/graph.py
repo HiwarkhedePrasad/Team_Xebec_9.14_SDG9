@@ -1,86 +1,95 @@
 """
-LangGraph state machine for the drone fleet coordinator agent.
-Orchestrates multi-drone operations for disaster response.
+LangGraph state machine for drone fleet coordination.
+Simplified for 2D terrain simulation (no AirSim).
 """
 
 import asyncio
 import logging
+import random
+import math
+import uuid
 from typing import Literal
 from datetime import datetime
 
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-from .state import DroneFleetState, DroneInfo, SurvivorLocation, Mission, Alert
-from .tools import drone_tools, set_airsim_client
-from . import airsim_bridge
+from .state import DroneFleetState, DroneInfo, SurvivorLocation, Mission, Alert, HeatSignature
 
 logger = logging.getLogger(__name__)
 
-# System prompt for the fleet coordinator
-FLEET_COORDINATOR_PROMPT = """You are the Fleet Coordinator AI for a disaster response drone system.
-
-Your mission: Coordinate a fleet of drones to efficiently search for survivors in a disaster zone and coordinate rescue operations.
-
-Current capabilities:
-- Monitor drone positions and battery levels
-- Dispatch drones to scan specific areas  
-- Detect survivors using thermal imaging
-- Coordinate rescue responses when survivors are found
-- Return low-battery drones to base
-
-Decision framework:
-1. SCAN: If drones are idle and areas remain unsearched, assign scan patterns
-2. RESPOND: If survivors are detected with high confidence, dispatch rescue
-3. COORDINATE: If multiple survivors detected, prioritize by confidence and accessibility
-4. RETURN: If drone battery < 25%, return it to base immediately
-
-Map info:
-- 15000x15000 unit map (5km x 5km real scale)
-- Known flood zones, earthquake faults, and settlements
-- Base station at (7500, 7500)
-
-Always prioritize survivor safety. Be efficient but thorough."""
+# Global queue for manual commands from socket/API
+# Structure: { drone_id: { "command": str, "mode": "manual"|"auto", "waypoints": [...] } }
+MANUAL_COMMANDS = {}
 
 
-def create_initial_state(mock_mode: bool = True) -> DroneFleetState:
-    """Create the initial state for the drone fleet."""
+# ============================================
+# Initial State
+# ============================================
+
+# Grid constants for fog of war
+GRID_CELL_SIZE = 500  # Each cell is 500x500 units
+GRID_SIZE = 30  # 30x30 grid = 15000x15000 map
+SCAN_RADIUS = 2  # Drones scan 2 cells around them
+
+
+def create_initial_state() -> DroneFleetState:
+    """Create the initial state for the drone fleet with 10 drones."""
     
-    # Initialize drones
-    drones = [
-        DroneInfo(
-            id="drone_alpha",
-            name="D-Alpha", 
-            x=3000, y=3000, z=-50,
-            status="idle",
-            battery=0.85,
-        ),
-        DroneInfo(
-            id="drone_beta",
-            name="D-Beta",
-            x=4500, y=3500, z=-50, 
-            status="idle",
-            battery=0.92,
-        ),
-        DroneInfo(
-            id="drone_gamma",
-            name="D-Gamma",
-            x=1500, y=2000, z=-50,
-            status="idle", 
-            battery=0.78,
-        ),
+    # Initialize 10 drones starting from top-left corner (base station)
+    base_x, base_y = 500, 500
+    drone_names = [
+        "Alpha", "Beta", "Gamma", "Delta", "Epsilon",
+        "Zeta", "Eta", "Theta", "Iota", "Kappa"
     ]
     
+    drones = []
+    for i, name in enumerate(drone_names):
+        # Spread drones in a small grid pattern at starting corner
+        row = i // 5  # 2 rows
+        col = i % 5   # 5 columns
+        offset_x = col * 100
+        offset_y = row * 100
+        
+        drones.append(DroneInfo(
+            id=f"drone_{name.lower()}",
+            name=f"D-{name}",
+            x=base_x + offset_x,
+            y=base_y + offset_y,
+            z=-20,  # Flying at 20m height
+            status="idle",
+            battery=1.0,  # Full battery
+            control_mode="auto",
+            waypoints=[],
+        ))
+    
+    # Heat Signatures (Persistent)
+    heat_signatures = []
+    for _ in range(15):
+        # Distribute mostly away from start corner
+        padding = 1000
+        heat_signatures.append(HeatSignature(
+            id=f"heat_{uuid.uuid4().hex[:6]}",
+            x=random.uniform(padding, 15000 - padding),
+            y=random.uniform(padding, 15000 - padding),
+            intensity=random.uniform(0.5, 1.0),
+            size=random.uniform(300, 800),  # Large area size
+        ))
+    
+    # Initialize with starting corner area already scanned
+    scanned = []
+    for x in range(5):
+        for y in range(5):
+             scanned.append((x, y))
+
     return {
         "drones": drones,
-        "survivors_detected": [],
         "missions": [],
+        "survivors": [],
         "alerts": [],
-        "situation_analysis": "",
-        "next_action": "scan",
         "tick": 0,
-        "mock_mode": mock_mode,
+        "scanned_cells": scanned,
+        "heat_signatures": heat_signatures,
+        "next_action": "analyze",
     }
 
 
@@ -89,38 +98,31 @@ def create_initial_state(mock_mode: bool = True) -> DroneFleetState:
 # ============================================
 
 def analyze_situation(state: DroneFleetState) -> dict:
-    """
-    Analyze the current situation and decide on next actions.
-    This is the "brain" of the coordinator.
-    """
+    """Analyze current situation and decide on next action."""
     drones = state["drones"]
     survivors = state["survivors_detected"]
-    missions = state["missions"]
     
-    # Count drone states
     idle_drones = [d for d in drones if d.status == "idle"]
     scanning_drones = [d for d in drones if d.status == "scanning"]
     low_battery_drones = [d for d in drones if d.battery < 0.25]
-    
-    # Count unrescued survivors
     unrescued = [s for s in survivors if not s.rescued]
     high_confidence = [s for s in unrescued if s.confidence > 0.8]
     
     # Determine next action
     if low_battery_drones:
-        next_action = "coordinate"  # Return low battery drones
-        analysis = f"⚠️ {len(low_battery_drones)} drone(s) have low battery. Returning to base."
+        next_action = "coordinate"
+        analysis = f"⚠️ {len(low_battery_drones)} drone(s) low battery"
     elif high_confidence:
         next_action = "respond"
-        analysis = f"🚨 {len(high_confidence)} high-confidence survivor(s) detected! Initiating rescue."
+        analysis = f"🚨 {len(high_confidence)} survivor(s) need rescue!"
     elif idle_drones:
         next_action = "scan"
-        analysis = f"📡 {len(idle_drones)} drone(s) available for scanning. Assigning search patterns."
+        analysis = f"📡 {len(idle_drones)} drone(s) ready to scan"
     else:
         next_action = "idle"
-        analysis = f"✓ All drones active. {len(scanning_drones)} scanning, monitoring for detections."
+        analysis = f"✓ {len(scanning_drones)} drone(s) scanning"
     
-    logger.info(f"Situation analysis: {analysis}")
+    logger.info(f"[Tick {state['tick']}] {analysis}")
     
     return {
         "situation_analysis": analysis,
@@ -130,93 +132,132 @@ def analyze_situation(state: DroneFleetState) -> dict:
 
 
 def dispatch_scan_missions(state: DroneFleetState) -> dict:
-    """
-    Assign scanning missions to idle drones.
-    Divides the map into sectors and assigns drones to unsearched areas.
-    """
-    import random
-    
-    drones = state["drones"]
-    missions = state["missions"]
-    new_missions = []
-    updated_drones = []
+    """Assign scanning missions to idle drones - target unexplored areas."""
+    drones = list(state["drones"])
+    missions = list(state["missions"])
+    scanned = set(state.get("scanned_cells", []))
     alerts = []
     
-    # Define scan sectors (divide map into grid)
-    sectors = [
-        (2000, 2000), (5000, 2000), (8000, 2000), (11000, 2000),
-        (2000, 5000), (5000, 5000), (8000, 5000), (11000, 5000),
-        (2000, 8000), (5000, 8000), (8000, 8000), (11000, 8000),
-        (2000, 11000), (5000, 11000), (8000, 11000), (11000, 11000),
-    ]
+    # Find unexplored cells (not in scanned set)
+    unexplored = []
+    for cx in range(GRID_SIZE):
+        for cy in range(GRID_SIZE):
+            if (cx, cy) not in scanned:
+                # Convert grid cell to world coordinates (center of cell)
+                world_x = cx * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+                world_y = cy * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+                unexplored.append((world_x, world_y))
     
-    # Find already-assigned sectors
-    assigned_sectors = {(m.target_x, m.target_y) for m in missions if m.status == "active"}
-    available_sectors = [s for s in sectors if s not in assigned_sectors]
+    # If all explored, we're done!
+    if not unexplored:
+        logger.info("🎉 Map fully explored!")
+        return {"drones": drones, "missions": missions, "alerts": alerts}
     
+    # Shuffle unexplored to distribute drones
+    random.shuffle(unexplored)
+    
+    # Find drones that can be assigned (idle or scanning without mission)
+    # Filter out MANUAL drones
+    updated_drones = []
+    assigned_this_tick = set()
+    
+    # Collect truly idle auto drones
+    idle_auto_drones = [d for d in drones if d.status == "idle" and d.control_mode == "auto"]
+
+    if not idle_auto_drones:
+        # If no idle auto drones, just update existing drones and return
+        for drone in drones:
+            if drone.control_mode == "manual":
+                updated_drones.append(drone)
+                continue
+            # Reset scanning drones to idle if they don't have an active mission
+            if drone.status == "scanning" and not drone.current_mission:
+                drone = DroneInfo(
+                    id=drone.id, name=drone.name,
+                    x=drone.x, y=drone.y, z=drone.z,
+                    status="idle", battery=drone.battery,
+                    current_mission=None, control_mode=drone.control_mode,
+                    waypoints=drone.waypoints, waypoint_index=drone.waypoint_index
+                )
+            updated_drones.append(drone)
+        return {"drones": updated_drones, "missions": missions, "alerts": alerts}
+
     for drone in drones:
-        if drone.status == "idle" and available_sectors:
-            # Assign a random available sector
-            sector = random.choice(available_sectors)
-            available_sectors.remove(sector)
+        if drone.control_mode == "manual":
+            updated_drones.append(drone)
+            continue
+            
+        # Reset scanning drones to idle if they don't have an active mission
+        if drone.status == "scanning" and not drone.current_mission:
+            drone = DroneInfo(
+                id=drone.id, name=drone.name,
+                x=drone.x, y=drone.y, z=drone.z,
+                status="idle", battery=drone.battery,
+                current_mission=None, control_mode=drone.control_mode,
+                waypoints=drone.waypoints, waypoint_index=drone.waypoint_index
+            )
+        
+        # Assign idle drones to unexplored areas
+        if drone.status == "idle" and drone.control_mode == "auto" and unexplored and drone.battery > 0.20:
+            # Find nearest unexplored cell to this drone
+            nearest = min(unexplored, key=lambda p: math.sqrt(
+                (p[0] - drone.x)**2 + (p[1] - drone.y)**2
+            ))
+            unexplored.remove(nearest)
             
             mission = Mission(
-                id=f"scan_{drone.id}_{state['tick']}",
+                id=f"explore_{drone.id}_{state['tick']}",
                 drone_id=drone.id,
                 mission_type="scan",
-                target_x=sector[0],
-                target_y=sector[1],
+                target_x=nearest[0],
+                target_y=nearest[1],
                 target_z=-50,
                 status="active",
             )
-            new_missions.append(mission)
+            missions.append(mission)
             
-            # Update drone status
-            drone.status = "scanning"
-            drone.current_mission = mission.id
+            drone = DroneInfo(
+                id=drone.id, name=drone.name,
+                x=drone.x, y=drone.y, z=drone.z,
+                status="scanning", battery=drone.battery,
+                current_mission=mission.id, control_mode=drone.control_mode,
+                waypoints=drone.waypoints, waypoint_index=drone.waypoint_index
+            )
             
-            logger.info(f"Assigned {drone.name} to scan sector ({sector[0]}, {sector[1]})")
+            logger.info(f"📡 {drone.name} → explore ({nearest[0]}, {nearest[1]})")
         
         updated_drones.append(drone)
     
-    if new_missions:
-        alerts.append(Alert(
-            type="MISSION_COMPLETE",
-            message=f"Dispatched {len(new_missions)} drone(s) for scanning",
-            payload={"missions": [m.id for m in new_missions]}
-        ))
+    # Log exploration progress
+    explored_count = len(scanned)
+    total_cells = GRID_SIZE * GRID_SIZE
+    progress = (explored_count / total_cells) * 100
+    logger.info(f"🗺️ Exploration: {progress:.1f}% ({explored_count}/{total_cells} cells)")
     
     return {
         "drones": updated_drones,
-        "missions": missions + new_missions,
+        "missions": missions,
         "alerts": alerts,
     }
 
 
 def respond_to_survivors(state: DroneFleetState) -> dict:
-    """
-    Coordinate response to detected survivors.
-    Dispatch nearest available drone for rescue assistance.
-    """
-    import math
-    
-    drones = state["drones"]
+    """Dispatch drones to rescue detected survivors."""
+    drones = list(state["drones"])
     survivors = state["survivors_detected"]
-    missions = state["missions"]
+    missions = list(state["missions"])
     alerts = []
-    updated_drones = []
-    new_missions = []
     
-    # Get unrescued high-confidence survivors
     unrescued = [s for s in survivors if not s.rescued and s.confidence > 0.8]
+    available = [d for d in drones if d.status in ["idle", "scanning"] and d.battery > 0.3 and d.control_mode == "auto"]
     
-    # Get available drones (idle or scanning with good battery)
-    available = [d for d in drones if d.status in ["idle", "scanning"] and d.battery > 0.3]
+    updated_drones = []
+    updated_survivors = list(survivors)
     
-    for survivor in unrescued[:len(available)]:  # Match survivors to available drones
+    for survivor in unrescued[:len(available)]:
         if not available:
             break
-            
+        
         # Find nearest drone
         nearest = min(available, key=lambda d: math.sqrt(
             (d.x - survivor.x)**2 + (d.y - survivor.y)**2
@@ -230,104 +271,231 @@ def respond_to_survivors(state: DroneFleetState) -> dict:
             mission_type="rescue",
             target_x=survivor.x,
             target_y=survivor.y,
-            target_z=-20,  # Lower altitude for rescue
+            target_z=-20,
             status="active",
         )
-        new_missions.append(mission)
+        missions.append(mission)
         
         # Update drone
-        nearest.status = "responding"
-        nearest.current_mission = mission.id
+        idx = next(i for i, d in enumerate(drones) if d.id == nearest.id)
+        drones[idx] = DroneInfo(
+            id=nearest.id,
+            name=nearest.name,
+            x=nearest.x,
+            y=nearest.y,
+            z=nearest.z,
+            status="responding",
+            battery=nearest.battery,
+            current_mission=mission.id,
+            control_mode=nearest.control_mode,
+            waypoints=nearest.waypoints,
+            waypoint_index=nearest.waypoint_index,
+        )
         
-        # Create alert
+        # Mark survivor as being rescued
+        for i, s in enumerate(updated_survivors):
+            if s.id == survivor.id:
+                updated_survivors[i].rescued = True
+        
         alerts.append(Alert(
             type="RESCUE_NEEDED",
-            message=f"Survivor detected! {nearest.name} responding to ({survivor.x:.0f}, {survivor.y:.0f})",
+            message=f"🚁 {nearest.name} responding to survivor!",
             payload={
                 "survivor_id": survivor.id,
                 "drone_id": nearest.id,
                 "location": {"x": survivor.x, "y": survivor.y},
-                "confidence": survivor.confidence,
             }
         ))
         
-        logger.info(f"🚨 Dispatched {nearest.name} to rescue survivor at ({survivor.x:.0f}, {survivor.y:.0f})")
-    
-    # Compile updated drones list
-    drone_dict = {d.id: d for d in drones}
-    for d in updated_drones:
-        drone_dict[d.id] = d
+        logger.info(f"🚁 {nearest.name} → rescue at ({survivor.x:.0f}, {survivor.y:.0f})")
     
     return {
-        "drones": list(drone_dict.values()),
-        "missions": missions + new_missions,
+        "drones": drones,
+        "survivors_detected": updated_survivors,
+        "missions": missions,
         "alerts": alerts,
     }
 
 
 def coordinate_fleet(state: DroneFleetState) -> dict:
-    """
-    General fleet coordination - handle low battery, return drones, etc.
-    """
-    drones = state["drones"]
-    missions = state["missions"]
+    """Handle low battery and return drones."""
+    drones = list(state["drones"])
+    missions = list(state["missions"])
     alerts = []
     updated_drones = []
-    new_missions = []
     
     for drone in drones:
-        if drone.battery < 0.25 and drone.status != "returning":
-            # Create return mission
+        if drone.battery < 0.25 and drone.status != "returning" and drone.control_mode == "auto":
             mission = Mission(
                 id=f"return_{drone.id}_{state['tick']}",
                 drone_id=drone.id,
                 mission_type="return",
-                target_x=7500,  # Base
+                target_x=7500,
                 target_y=7500,
                 target_z=-10,
                 status="active",
             )
-            new_missions.append(mission)
+            missions.append(mission)
             
-            drone.status = "returning"
-            drone.current_mission = mission.id
+            drone = DroneInfo(
+                id=drone.id,
+                name=drone.name,
+                x=drone.x,
+                y=drone.y,
+                z=drone.z,
+                status="returning",
+                battery=drone.battery,
+                current_mission=mission.id,
+                control_mode=drone.control_mode,
+                waypoints=drone.waypoints,
+                waypoint_index=drone.waypoint_index,
+            )
             
             alerts.append(Alert(
                 type="DRONE_LOW_BATTERY",
-                message=f"{drone.name} returning to base (battery: {drone.battery:.0%})",
+                message=f"⚠️ {drone.name} returning ({drone.battery:.0%} battery)",
                 payload={"drone_id": drone.id, "battery": drone.battery}
             ))
             
-            logger.warning(f"⚠️ {drone.name} low battery ({drone.battery:.0%}), returning to base")
+            logger.warning(f"⚠️ {drone.name} low battery, returning")
         
         updated_drones.append(drone)
     
     return {
         "drones": updated_drones,
-        "missions": missions + new_missions,
+        "missions": missions,
         "alerts": alerts,
     }
 
 
+def update_positions(state: DroneFleetState) -> dict:
+    """Simulate drone movement based on missions or manual waypoints."""
+    drones = list(state["drones"])
+    missions = list(state["missions"])
+    new_scanned_cells = []
+    updated_drones = []
+    
+    SPEED = 200  # Units per tick (approx 66 m/s)
+    
+    for drone in drones:
+        new_x, new_y = drone.x, drone.y
+        new_status = drone.status
+        new_battery = drone.battery
+        current_mission = drone.current_mission
+        control_mode = drone.control_mode
+        waypoints = list(drone.waypoints)
+        waypoint_index = drone.waypoint_index
+        
+        # 1. Apply any pending manual commands
+        if drone.id in MANUAL_COMMANDS:
+            cmd = MANUAL_COMMANDS.pop(drone.id)
+            if "mode" in cmd:
+                control_mode = cmd["mode"]
+            if "waypoints" in cmd:
+                waypoints = cmd["waypoints"]
+                waypoint_index = 0
+                new_status = "active" if waypoints else "idle"
+            # Clear mission if switching to manual
+            if control_mode == "manual":
+                current_mission = None
+        
+        # 2. Movement Logic
+        if control_mode == "manual":
+            # Manual Control: Follow waypoints
+            if waypoints and waypoint_index < len(waypoints):
+                target_x, target_y = waypoints[waypoint_index]
+                
+                dx = target_x - drone.x
+                dy = target_y - drone.y
+                dist = math.sqrt(dx*dx + dy*dy)
+                
+                if dist < SPEED:
+                    # Arrived at waypoint
+                    new_x, new_y = target_x, target_y
+                    waypoint_index += 1
+                    
+                    if waypoint_index >= len(waypoints):
+                        # End of path
+                        new_status = "idle"
+                else:
+                    # Move towards waypoint
+                    new_status = "active"
+                    new_x = drone.x + (dx / dist) * SPEED
+                    new_y = drone.y + (dy / dist) * SPEED
+            else:
+                new_status = "idle"
+                
+        else:
+            # Auto Logic: Follow Missions
+            if drone.current_mission:
+                # Find the mission
+                mission = next((m for m in missions if m.id == drone.current_mission), None)
+                if mission and mission.status == "active":
+                    # Calculate direction
+                    dx = mission.target_x - drone.x
+                    dy = mission.target_y - drone.y
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    
+                    if dist < SPEED:
+                        # Arrived at destination
+                        new_x, new_y = mission.target_x, mission.target_y
+                        mission.status = "completed"
+                        
+                        # Reset to idle (or scanning at destination)
+                        new_status = "scanning" if mission.mission_type == "scan" else "idle"
+                        if mission.mission_type == "return":
+                            new_status = "charging"
+                            new_battery = min(1.0, new_battery + 0.1)  # Recharge
+                        current_mission = None
+                    else:
+                        # Move towards target
+                        new_x = drone.x + (dx / dist) * SPEED
+                        new_y = drone.y + (dy / dist) * SPEED
+                    
+                    # Drain battery slightly
+                    new_battery = max(0, new_battery - 0.003)
+        
+        # Track cells scanned by this drone (fog of war reveal)
+        cell_x = int(new_x // GRID_CELL_SIZE)
+        cell_y = int(new_y // GRID_CELL_SIZE)
+        
+        # Scan cells in radius around drone
+        for dx in range(-SCAN_RADIUS, SCAN_RADIUS + 1):
+            for dy in range(-SCAN_RADIUS, SCAN_RADIUS + 1):
+                cx, cy = cell_x + dx, cell_y + dy
+                if 0 <= cx < GRID_SIZE and 0 <= cy < GRID_SIZE:
+                    new_scanned_cells.append((cx, cy))
+        
+        updated_drones.append(DroneInfo(
+            id=drone.id,
+            name=drone.name,
+            x=new_x,
+            y=new_y,
+            z=drone.z,
+            status=new_status,
+            battery=new_battery,
+            current_mission=current_mission,
+            control_mode=control_mode,
+            waypoints=waypoints,
+            waypoint_index=waypoint_index,
+        ))
+    
+    return {
+        "drones": updated_drones,
+        "scanned_cells": new_scanned_cells,
+    }
+
+
 def simulate_detections(state: DroneFleetState) -> dict:
-    """
-    Simulate thermal detections from scanning drones (mock mode).
-    In real mode, this would process actual camera feeds.
-    """
-    import random
-    import uuid
-    
-    if not state["mock_mode"]:
-        return {}  # No simulation in real mode
-    
+    """Simulate thermal detections from scanning drones."""
     drones = state["drones"]
     new_survivors = []
     alerts = []
     
     for drone in drones:
         if drone.status == "scanning":
-            # 15% chance of detecting a survivor each tick
-            if random.random() < 0.15:
+            # 12% chance of detection per tick
+            if random.random() < 0.12:
                 survivor = SurvivorLocation(
                     id=f"survivor_{uuid.uuid4().hex[:6]}",
                     x=drone.x + random.uniform(-300, 300),
@@ -339,11 +507,11 @@ def simulate_detections(state: DroneFleetState) -> dict:
                 
                 alerts.append(Alert(
                     type="SURVIVOR_DETECTED",
-                    message=f"🔥 Heat signature detected by {drone.name}!",
+                    message=f"🔥 {drone.name} detected heat signature!",
                     payload=survivor.to_dict()
                 ))
                 
-                logger.info(f"🔥 {drone.name} detected survivor at ({survivor.x:.0f}, {survivor.y:.0f})")
+                logger.info(f"🔥 {drone.name} found survivor at ({survivor.x:.0f}, {survivor.y:.0f})")
     
     return {
         "survivors_detected": new_survivors,
@@ -351,16 +519,15 @@ def simulate_detections(state: DroneFleetState) -> dict:
     }
 
 
-def should_continue(state: DroneFleetState) -> Literal["analyze", "end"]:
-    """Determine if we should continue the loop or end."""
-    # End after a certain number of ticks (for demo purposes)
-    if state["tick"] >= 100:
+def should_continue(state: DroneFleetState) -> Literal["continue", "end"]:
+    """Check if we should continue the simulation."""
+    if state["tick"] >= 1000:  # Limit for safety
         return "end"
-    return "analyze"
+    return "continue"
 
 
 def route_action(state: DroneFleetState) -> str:
-    """Route to the appropriate action node based on analysis."""
+    """Route to appropriate action based on analysis."""
     action = state["next_action"]
     if action == "scan":
         return "dispatch_scan"
@@ -368,19 +535,15 @@ def route_action(state: DroneFleetState) -> str:
         return "respond_survivors"
     elif action == "coordinate":
         return "coordinate_fleet"
-    else:
-        return "simulate"  # Idle, just simulate
+    return "update_positions"
 
 
 # ============================================
-# Build the Graph
+# Build Graph
 # ============================================
 
 def create_drone_fleet_agent():
-    """
-    Create and compile the LangGraph for drone fleet coordination.
-    """
-    # Create the graph with our state type
+    """Create the LangGraph for drone fleet coordination."""
     graph = StateGraph(DroneFleetState)
     
     # Add nodes
@@ -388,12 +551,13 @@ def create_drone_fleet_agent():
     graph.add_node("dispatch_scan", dispatch_scan_missions)
     graph.add_node("respond_survivors", respond_to_survivors)
     graph.add_node("coordinate_fleet", coordinate_fleet)
+    graph.add_node("update_positions", update_drone_positions)
     graph.add_node("simulate", simulate_detections)
     
-    # Set entry point
+    # Entry point
     graph.set_entry_point("analyze")
     
-    # Add conditional edges from analyze
+    # Routing from analyze
     graph.add_conditional_edges(
         "analyze",
         route_action,
@@ -401,85 +565,80 @@ def create_drone_fleet_agent():
             "dispatch_scan": "dispatch_scan",
             "respond_survivors": "respond_survivors",
             "coordinate_fleet": "coordinate_fleet",
-            "simulate": "simulate",
+            "update_positions": "update_positions",
         }
     )
     
-    # All action nodes go to simulate, then back to analyze (or end)
-    graph.add_edge("dispatch_scan", "simulate")
-    graph.add_edge("respond_survivors", "simulate")
-    graph.add_edge("coordinate_fleet", "simulate")
+    # All actions -> update positions -> simulate -> check continue
+    graph.add_edge("dispatch_scan", "update_positions")
+    graph.add_edge("respond_survivors", "update_positions")
+    graph.add_edge("coordinate_fleet", "update_positions")
+    graph.add_edge("update_positions", "simulate")
     
-    # Simulate goes back to analyze or ends
     graph.add_conditional_edges(
         "simulate",
         should_continue,
         {
-            "analyze": "analyze",
+            "continue": "analyze",
             "end": END,
         }
     )
     
-    # Compile the graph
     return graph.compile()
 
 
 async def run_agent_loop(
     emit_callback=None,
-    tick_interval: float = 2.0,
-    mock_mode: bool = True
+    tick_interval: float = 3.0,
 ):
     """
-    Run the drone fleet agent in a loop.
+    Run the drone fleet agent in a continuous loop.
     
     Args:
-        emit_callback: Async function to emit updates (e.g., Socket.IO emit)
+        emit_callback: Async function to emit Socket.IO events
         tick_interval: Seconds between agent ticks
-        mock_mode: If True, use simulated data; if False, connect to AirSim
     """
-    # Try to connect to AirSim
-    if not mock_mode:
-        connected = airsim_bridge.try_connect_airsim()
-        if connected:
-            set_airsim_client(airsim_bridge.get_client(), mock=False)
-        else:
-            logger.warning("Falling back to mock mode")
-            mock_mode = True
-    
-    set_airsim_client(None, mock=mock_mode)
-    
-    # Create the agent graph
     agent = create_drone_fleet_agent()
+    state = create_initial_state()
     
-    # Initialize state
-    state = create_initial_state(mock_mode=mock_mode)
+    logger.info("🚀 Drone Fleet Coordinator started (2D simulation mode)")
     
-    logger.info(f"🚀 Starting Drone Fleet Coordinator (mock_mode={mock_mode})")
-    
-    # Run the agent loop
-    async for event in agent.astream(state):
-        # Get the latest state from the event
-        for node_name, node_output in event.items():
-            logger.debug(f"Node '{node_name}' output: {node_output}")
-            
-            # Emit updates via callback
-            if emit_callback:
-                # Emit drone positions
-                if "drones" in node_output:
-                    await emit_callback("drone_update", {
-                        "drones": [d.to_dict() if hasattr(d, 'to_dict') else d for d in node_output["drones"]]
-                    })
+    try:
+        async for event in agent.astream(state):
+            for node_name, node_output in event.items():
+                logger.debug(f"[{node_name}] {node_output}")
                 
-                # Emit alerts
-                if "alerts" in node_output:
-                    for alert in node_output["alerts"]:
-                        await emit_callback("alert", {
-                            "type": alert.type,
-                            "message": alert.message,
-                            "payload": alert.payload,
+                if emit_callback:
+                    # Emit drone positions
+                    if "drones" in node_output:
+                        drones_data = [
+                            d.to_dict() if hasattr(d, 'to_dict') else d 
+                            for d in node_output["drones"]
+                        ]
+                        await emit_callback("drone_update", {"drones": drones_data})
+                    
+                    # Emit scanned cells for fog of war
+                    if "scanned_cells" in node_output and node_output["scanned_cells"]:
+                        await emit_callback("scan_update", {
+                            "cells": node_output["scanned_cells"]
                         })
-        
-        # Wait before next tick
-        await asyncio.sleep(tick_interval)
+                    
+                    # Emit alerts
+                    if "alerts" in node_output:
+                        for alert in node_output["alerts"]:
+                            await emit_callback("alert", {
+                                "type": alert.type,
+                                "message": alert.message,
+                                "payload": alert.payload,
+                            })
+            
+            await asyncio.sleep(tick_interval)
+            
+    except asyncio.CancelledError:
+        logger.info("Agent loop cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Agent error: {e}")
+        raise
     
     logger.info("Agent loop completed")

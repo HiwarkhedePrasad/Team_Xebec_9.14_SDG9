@@ -20,6 +20,9 @@ class DroneInfo:
     status: Literal["idle", "scanning", "responding", "returning", "charging"]
     battery: float  # 0.0 to 1.0
     current_mission: str | None = None
+    control_mode: Literal["auto", "manual"] = "auto"
+    waypoints: list[tuple[float, float]] = field(default_factory=list)
+    waypoint_index: int = 0
     
     def to_dict(self) -> dict:
         return {
@@ -31,6 +34,8 @@ class DroneInfo:
             "status": self.status,
             "battery": self.battery,
             "current_mission": self.current_mission,
+            "control_mode": self.control_mode,
+            "waypoints": self.waypoints,
         }
 
 
@@ -96,6 +101,25 @@ def merge_lists(a: list, b: list) -> list:
     return a + b
 
 
+@dataclass
+class HeatSignature:
+    """A thermal signature on the map (potential survivor)."""
+    id: str
+    x: float
+    y: float
+    intensity: float  # 0.0 to 1.0
+    size: float
+    
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "x": self.x,
+            "y": self.y,
+            "intensity": self.intensity,
+            "size": self.size,
+        }
+
+
 class DroneFleetState(TypedDict):
     """
     The state of the entire drone fleet system.
@@ -105,13 +129,17 @@ class DroneFleetState(TypedDict):
     drones: list[DroneInfo]
     
     # Detections
-    survivors_detected: Annotated[list[SurvivorLocation], operator.add]
+    survivors: Annotated[list[SurvivorLocation], operator.add]
     
     # Active missions
     missions: list[Mission]
     
     # Alerts to emit
     alerts: Annotated[list[Alert], operator.add]
+    
+    # Scanned/explored cells (grid coordinates that drones have visited)
+    # Each cell is a tuple (grid_x, grid_y) where grid is 30x30 (500 units per cell)
+    scanned_cells: Annotated[list[tuple[int, int]], operator.add]
     
     # Current analysis from the AI
     situation_analysis: str
