@@ -134,37 +134,66 @@ def analyze_situation(state: DroneFleetState) -> dict:
 
 
 def dispatch_scan_missions(state: DroneFleetState) -> dict:
-    """Assign scanning missions to idle drones - target unexplored areas."""
+    """Assign scanning missions to idle drones - target unexplored or under-scanned areas."""
     drones = list(state["drones"])
     missions = list(state["missions"])
-    scanned = set(state.get("scanned_cells", []))
     alerts = []
     
-    # Find unexplored cells (not in scanned set)
-    unexplored = []
-    for cx in range(GRID_SIZE):
+    # Get scanned_cells grid (new 3-layer format)
+    scanned_grid = state.get("scanned_cells", [])
+    
+    # Build set of fully scanned cells (count >= 3) for backward compatibility
+    fully_scanned = set()
+    needs_more_scans = []  # Cells with count < 3
+    
+    if isinstance(scanned_grid, list) and len(scanned_grid) == GRID_SIZE:
+        # New format: 2D grid where each cell is {"count": 0-3, "drone_ids": []}
         for cy in range(GRID_SIZE):
-            if (cx, cy) not in scanned:
-                # Convert grid cell to world coordinates (center of cell)
-                world_x = cx * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
-                world_y = cy * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
-                unexplored.append((world_x, world_y))
-            else:
-                pass # We handle re-scans below
+            for cx in range(GRID_SIZE):
+                cell = scanned_grid[cy][cx] if isinstance(scanned_grid[cy], list) else {}
+                count = cell.get("count", 0) if isinstance(cell, dict) else (3 if cell else 0)
+                if count >= 3:
+                    fully_scanned.add((cx, cy))
+                else:
+                    # This cell needs more scans (0, 1, or 2 drones have scanned it)
+                    needs_more_scans.append((cx, cy, count))
+    else:
+        # Old format: list of (x,y) tuples
+        if isinstance(scanned_grid, list):
+            for cell in scanned_grid:
+                if isinstance(cell, (tuple, list)) and len(cell) == 2:
+                    fully_scanned.add((cell[0], cell[1]))
+        # Build needs_more_scans for cells not in fully_scanned
+        for cx in range(GRID_SIZE):
+            for cy in range(GRID_SIZE):
+                if (cx, cy) not in fully_scanned:
+                    needs_more_scans.append((cx, cy, 0))
+    
+    # Find cells that need scanning (prioritize by count - lower count = higher priority)
+    unexplored = []
+    needs_more_scans.sort(key=lambda x: x[2])  # Sort by count ascending
+    
+    for cx, cy, count in needs_more_scans:
+        # Convert grid cell to world coordinates (center of cell)
+        world_x = cx * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+        world_y = cy * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+        unexplored.append((world_x, world_y))
 
-    # Check for 100% completion for logging (but don't stop)
+    # Log unexplored count to debug "stopping halfway" issue
+    if state['tick'] % 20 == 0:
+        logger.info(f"📊 Unexplored targets: {len(unexplored)} | Needs more scans: {len(needs_more_scans)}")
+
+    # Check for 100% full coverage (all 3 layers) for logging
     total_cells = GRID_SIZE * GRID_SIZE
-    if len(scanned) == total_cells and not getattr(dispatch_scan_missions, "logged_complete", False):
-        logger.info("🎉 Map fully explored! Switching to patrol mode (15% re-scan).")
+    if len(fully_scanned) == total_cells and not getattr(dispatch_scan_missions, "logged_complete", False):
+        logger.info("🎉 Map fully explored with 3-layer redundancy!")
         dispatch_scan_missions.logged_complete = True
     
-    # REDUNDANCY LOGIC:
-    # Add back 15% of already scanned cells to "unexplored" pool to force re-visiting
-    # This ensures that if a survivor was missed, another drone might find them.
-    if scanned:
-        # Convert scanned set back to world coordinates lists
-        scanned_list = list(scanned)
-        num_rescan = int(len(scanned_list) * 0.15)
+    # If all cells are fully scanned, add some random rescan targets for continued coverage
+    if not unexplored and fully_scanned:
+        # Convert fully scanned set back to world coordinates for random patrol
+        scanned_list = list(fully_scanned)
+        num_rescan = min(len(scanned_list), max(5, int(len(scanned_list) * 0.1)))
         rescan_cells = random.sample(scanned_list, num_rescan)
         
         for cx, cy in rescan_cells:
@@ -176,9 +205,12 @@ def dispatch_scan_missions(state: DroneFleetState) -> dict:
         # Should rarely happen with re-scan logic
         return {"drones": drones, "missions": missions, "alerts": alerts}
     
-    # Shuffle unexplored to distribute drones
-    random.shuffle(unexplored)
+    # Shuffle unexplored to distribute drones (but keep general prioritization)
+    # random.shuffle(unexplored) # Don't shuffle strictly, we want low counts first?
+    # Actually, shuffling within "same count" groups would be better, but simple shuffle is fine if we have enough targets
     
+
+
     # Memory Cleanup: Remove completed missions older than 100 ticks
     # Or just keep active ones + last 10 completed?
     # Simple cleanup: keep only active missions
@@ -229,50 +261,124 @@ def dispatch_scan_missions(state: DroneFleetState) -> dict:
                 waypoints=drone.waypoints, waypoint_index=drone.waypoint_index
             )
         
-        # Assign idle drones to unexplored areas
-        if drone.status == "idle" and drone.control_mode == "auto" and unexplored and drone.battery > 0.20:
-            # Find nearest unexplored cell to this drone
-            nearest = min(unexplored, key=lambda p: math.sqrt(
-                (p[0] - drone.x)**2 + (p[1] - drone.y)**2
-            ))
-            unexplored.remove(nearest)
+        # Assign idle drones to unexplored areas - spread them out and PRIORITY BY SCAN COUNT
+        if drone.status == "idle" and drone.control_mode == "auto" and drone.battery > 0.20:
+            # 3-Layer Priority Logic: always prefer lower scan count (0 > 1 > 2)
+            # Group available targets by priority
+            level0_unexplored = []
+            level1_partial = []
+            level2_almost = []
             
-            # Generate A* path
-            path = a_star_search(
-                start=(drone.x, drone.y),
-                goal=(nearest[0], nearest[1]),
-                grid_size=GRID_SIZE,
-                cell_size=GRID_CELL_SIZE
-            )
+            # We need to rebuild priority lists from current 'unexplored' (which is just coords)
+            # But 'unexplored' doesn't store count. So we need to look back at 'needs_more_scans'.
+            # Better approach: Filter 'unexplored' based on where they came from?
+            # Actually, 'unexplored' was built from 'needs_more_scans' sorted by count.
+            # So the first N elements are count 0, then count 1...
+            # But calculating split points is hard.
+            # Let's just use 'needs_more_scans' directly?
+            # No, 'unexplored' tracks which ones are ALREADY taken by other drones in *this* loop? 
+            # Wait, 'unexplored' is modified by .remove(nearest).
             
-            mission = Mission(
-                id=f"explore_{drone.id}_{state['tick']}",
-                drone_id=drone.id,
-                mission_type="scan",
-                target_x=nearest[0],
-                target_y=nearest[1],
-                target_z=-50,
-                status="active",
-            )
-            missions.append(mission)
+            # Let's iterate 'unexplored' and re-check their count from state grid?
+            # Grid access is available via 'state.get("scanned_cells")'. Is it efficient? YES.
             
-            drone = DroneInfo(
-                id=drone.id, name=drone.name,
-                x=drone.x, y=drone.y, z=drone.z,
-                status="scanning", battery=drone.battery,
-                current_mission=mission.id, control_mode=drone.control_mode,
-                waypoints=path, waypoint_index=1  # Start from index 1 (skipping start pos)
-            )
+            # Filter targets by priority level
+            # Optimize: We trust 'needs_more_scans' order if we re-used it, but 'unexplored' is just list of tuples.
+            # Let's just iterate 'unexplored' and pick the BEST candidate.
             
-            logger.info(f"📡 {drone.name} → explore ({nearest[0]}, {nearest[1]}) via A*")
+            # Collect positions of other active drones to avoid clustering
+            other_drone_targets = set()
+            for other in drones:
+                if other.id != drone.id and other.waypoints and len(other.waypoints) > 0:
+                    final_wp = other.waypoints[-1]
+                    target_cx = int(final_wp[0] // GRID_CELL_SIZE)
+                    target_cy = int(final_wp[1] // GRID_CELL_SIZE)
+                    for dx in range(-1, 2):  # 1-cell radius
+                        for dy in range(-1, 2):
+                            other_drone_targets.add((target_cx + dx, target_cy + dy))
+            
+            # Find available targets not blocked by others
+            available_targets = []
+            for p in unexplored:
+                cx = int(p[0] // GRID_CELL_SIZE)
+                cy = int(p[1] // GRID_CELL_SIZE)
+                if (cx, cy) not in other_drone_targets:
+                    # Find original count from 'needs_more_scans' or grid?
+                    # Grid is safer (real-time)
+                    # Assume state grid is passed? No, 'scanned_grid' var exists in scope?
+                    # Yes, 'scanned_grid' is available from earlier in function.
+                    
+                    # Get Count
+                    count = 0 
+                    if isinstance(scanned_grid, list) and len(scanned_grid) > cy and isinstance(scanned_grid[cy], list) and len(scanned_grid[cy]) > cx:
+                            cell = scanned_grid[cy][cx]
+                            count = cell.get("count", 0) if isinstance(cell, dict) else (3 if cell else 0)
+                    
+                    available_targets.append((p, count))
+            
+            # Fallback if all blocked or no targets found in priority filter
+            if not available_targets:
+                 # DEMO MODE FALLBACK: Just pick ANY unexplored cell
+                 if unexplored:
+                     # Pick random to look active
+                     import random
+                     random_target = random.choice(unexplored)
+                     available_targets = [(random_target, 99)]
+                 else:
+                     # Map fully explored? Pick ANY random cell on map to keep moving
+                     rx = random.randint(0, GRID_SIZE-1) * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+                     ry = random.randint(0, GRID_SIZE-1) * GRID_CELL_SIZE + GRID_CELL_SIZE // 2
+                     available_targets = [((rx, ry), 99)]
+            
+            if available_targets:
+                # Sort candidates: First by Count (ascending), THEN by Distance (ascending)
+                # This ensures strict priority: Closest Count-0 > furthest Count-0 > Closest Count-1
+                best_target_tuple = min(available_targets, key=lambda item: (
+                    item[1], # Primary sort: Count (0 then 1 then 2)
+                    math.sqrt((item[0][0] - drone.x)**2 + (item[0][1] - drone.y)**2) # Secondary: Distance
+                ))
+                
+                nearest = best_target_tuple[0]
+                if nearest in unexplored:
+                    unexplored.remove(nearest)
+                
+                # Generate A* path
+                path = a_star_search(
+                    start=(drone.x, drone.y),
+                    goal=(nearest[0], nearest[1]),
+                    grid_size=GRID_SIZE,
+                    cell_size=GRID_CELL_SIZE
+                )
+                
+                mission = Mission(
+                    id=f"explore_{drone.id}_{state['tick']}",
+                    drone_id=drone.id,
+                    mission_type="scan",
+                    target_x=nearest[0],
+                    target_y=nearest[1],
+                    target_z=-50,
+                    status="active",
+                )
+                missions.append(mission)
+                
+                drone = DroneInfo(
+                    id=drone.id, name=drone.name,
+                    x=drone.x, y=drone.y, z=drone.z,
+                    status="scanning", battery=drone.battery,
+                    current_mission=mission.id, control_mode=drone.control_mode,
+                    waypoints=path, waypoint_index=1 
+                )
+                
+                updated_drones.append(drone)
+                continue
         
         updated_drones.append(drone)
     
     # Log exploration progress
-    explored_count = len(scanned)
+    explored_count = len(fully_scanned)
     total_cells = GRID_SIZE * GRID_SIZE
     progress = (explored_count / total_cells) * 100
-    logger.info(f"🗺️ Exploration: {progress:.1f}% ({explored_count}/{total_cells} cells)")
+    logger.info(f"🗺️ Exploration (3-layer): {progress:.1f}% ({explored_count}/{total_cells} cells fully scanned)")
     
     return {
         "drones": updated_drones,
@@ -439,7 +545,7 @@ def update_positions(state: DroneFleetState) -> dict:
     new_scanned_cells = []
     updated_drones = []
     
-    SPEED = 300  # Units per tick (Fast simulation)
+    SPEED = 500  # Units per tick (Faster movement for better coverage)
     
     for drone in drones:
         new_x, new_y = drone.x, drone.y
@@ -590,13 +696,44 @@ def update_positions(state: DroneFleetState) -> dict:
         ))
     
     # Deduplicate scanned cells
-    # We must merge existing scanned + new scanned and remove duplicates
-    all_scanned = set(state.get("scanned_cells", []))
-    all_scanned.update(new_scanned_cells)
+    # Now using 3-layer tracking: each cell stores count of unique drones that scanned it
+    # Format: 2D grid where each cell is {"count": 0-3, "drone_ids": []}
+    existing_grid = state.get("scanned_cells", [])
+    
+    # Initialize or get existing grid
+    if not existing_grid or not isinstance(existing_grid, list) or len(existing_grid) != GRID_SIZE:
+        grid = [[{"count": 0, "drone_ids": []} for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+    elif isinstance(existing_grid[0], tuple) or (isinstance(existing_grid[0], list) and len(existing_grid[0]) == 2 and isinstance(existing_grid[0][0], int)):
+        # Old format: list of (x,y) tuples - migrate to new format
+        grid = [[{"count": 0, "drone_ids": []} for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+        for cell in existing_grid:
+            if isinstance(cell, (tuple, list)) and len(cell) == 2:
+                cx, cy = cell
+                if 0 <= cx < GRID_SIZE and 0 <= cy < GRID_SIZE:
+                    grid[cy][cx]["count"] = 3  # Mark as fully scanned if already visited
+    else:
+        # Already in new format - deep copy
+        grid = [[{"count": cell.get("count", 0), "drone_ids": list(cell.get("drone_ids", []))} 
+                 for cell in row] for row in existing_grid]
+    
+    # Update grid with new scanned cells (track unique drone IDs, max 3 layers)
+    for drone in updated_drones:
+        cell_x = int(drone.x // GRID_CELL_SIZE)
+        cell_y = int(drone.y // GRID_CELL_SIZE)
+        
+        for dx in range(-SCAN_RADIUS, SCAN_RADIUS + 1):
+            for dy in range(-SCAN_RADIUS, SCAN_RADIUS + 1):
+                cx, cy = cell_x + dx, cell_y + dy
+                if 0 <= cx < GRID_SIZE and 0 <= cy < GRID_SIZE:
+                    cell = grid[cy][cx]
+                    # Only add if this drone hasn't scanned this cell and count < 3
+                    if drone.id not in cell["drone_ids"] and cell["count"] < 3:
+                        cell["drone_ids"].append(drone.id)
+                        cell["count"] += 1
     
     return {
         "drones": updated_drones,
-        "scanned_cells": list(all_scanned),
+        "scanned_cells": grid,
     }
 
 
@@ -631,6 +768,16 @@ def simulate_detections(state: DroneFleetState) -> dict:
     # Merge with existing survivors
     all_survivors = list(state["survivors_detected"])
     all_survivors.extend(new_survivors)
+    
+    # MEMORY CLEANUP: Remove rescued survivors to prevent memory leak
+    # Keep only: unrescued survivors + last 10 rescued (for UI display)
+    unrescued = [s for s in all_survivors if not s.rescued]
+    rescued = [s for s in all_survivors if s.rescued]
+    all_survivors = unrescued + rescued[-10:]  # Keep only last 10 rescued
+    
+    # Also limit total survivors to prevent runaway growth
+    if len(all_survivors) > 50:
+        all_survivors = all_survivors[-50:]  # Keep most recent 50
     
     return {
         "survivors_detected": all_survivors,
@@ -720,6 +867,12 @@ async def run_agent_loop(
     state = create_initial_state()
     
     logger.info("🚀 Drone Fleet Coordinator started (2D simulation mode)")
+
+    # Emit initial state (drones + heat signatures)
+    await emit_callback("drone_update", {
+        "drones": [d.to_dict() for d in state["drones"]],
+        "heat_signatures": [h.to_dict() for h in state["heat_signatures"]]
+    })
     
     try:
         async for event in agent.astream(state):
@@ -735,10 +888,11 @@ async def run_agent_loop(
                         ]
                         await emit_callback("drone_update", {"drones": drones_data})
                     
-                    # Emit scanned cells for fog of war
+                    # Emit scanned cells for fog of war (3-layer grid)
                     if "scanned_cells" in node_output and node_output["scanned_cells"]:
+                        # Send full grid with count per cell for 3-layer visualization
                         await emit_callback("scan_update", {
-                            "cells": node_output["scanned_cells"]
+                            "grid": node_output["scanned_cells"]
                         })
                     
                     # Emit alerts

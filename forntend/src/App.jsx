@@ -59,7 +59,7 @@ export default function App() {
     });
     const socket = socketRef.current;
 
-    // Create throttled handler (100ms minimum between updates)
+    // Create throttled handler (16ms = ~60fps)
     throttledDroneUpdate.current = throttle((data) => {
       if (data.drones) {
         setDrones(data.drones);
@@ -67,7 +67,7 @@ export default function App() {
       if (data.heat_signatures) {
         setHeatSignatures(data.heat_signatures);
       }
-    }, 100);
+    }, 16);
 
     socket.on("connect", () => {
       console.log("✓ Connected to Drone Fleet Coordinator");
@@ -95,9 +95,13 @@ export default function App() {
       }
     });
 
-    // Receive scanned cells for fog of war
+    // Receive scanned cells for fog of war (3-layer grid)
     socket.on("scan_update", (data) => {
-      if (data.cells && data.cells.length > 0) {
+      // New format: full grid with count per cell for 3-layer visualization
+      if (data.grid) {
+        setScannedCells(data.grid);
+      } else if (data.cells && data.cells.length > 0) {
+        // Legacy format: list of (x, y) tuples
         setScannedCells((prev) => {
           const newGrid = prev.map(row => [...row]);
           for (const [x, y] of data.cells) {
@@ -225,43 +229,51 @@ export default function App() {
 
   return (
     <div>
-      {/* Header with tabs */}
-      <div className="app-header">
-        <h2>
-          🌍 Team Xebec - Disaster Response
-          <span
-            style={{
-              marginLeft: "1rem",
-              fontSize: "0.8rem",
-              color: connected ? "#22c55e" : "#ef4444",
-            }}
-          >
-            {connected ? "● Connected" : "○ Disconnected"}
-          </span>
-        </h2>
+      {/* Professional Sidebar Navigation */}
+      <nav className="app-sidebar">
+        <div className="sidebar-brand">
+          <span className="brand-icon">🚁</span>
+        </div>
         
-        {/* Tab Navigation */}
-        <div className="tab-buttons">
+        <div className="nav-items">
           <button 
-            className={`tab-btn ${activeTab === "map" ? "active" : ""}`}
+            className={`nav-item ${activeTab === "map" ? "active" : ""}`}
             onClick={() => setActiveTab("map")}
+            title="Live Map"
           >
-            🗺️ Map View
+            <span className="nav-icon">🗺️</span>
+            <span className="nav-label">Map</span>
           </button>
+          
           <button 
-            className={`tab-btn ${activeTab === "dashboard" ? "active" : ""}`}
+            className={`nav-item ${activeTab === "dashboard" ? "active" : ""}`}
             onClick={() => setActiveTab("dashboard")}
+            title="Rescue Dashboard"
           >
-            🚨 Dashboard
+            <span className="nav-icon">🚨</span>
+            <span className="nav-label">Rescue</span>
+            {awaitingRescue > 0 && <span className="nav-badge urgent">{awaitingRescue}</span>}
           </button>
+          
           <button 
-            className={`tab-btn ${activeTab === "command" ? "active" : ""}`}
+            className={`nav-item ${activeTab === "command" ? "active" : ""}`}
             onClick={() => setActiveTab("command")}
+            title="Command Center"
           >
-            🎮 Command
+            <span className="nav-icon">🎮</span>
+            <span className="nav-label">Command</span>
           </button>
         </div>
-      </div>
+
+        <div className="sidebar-footer">
+          <div className={`connection-status ${connected ? "online" : "offline"}`} title={connected ? "Connected" : "Disconnected"}>
+            <div className="status-dot"></div>
+          </div>
+        </div>
+      </nav>
+
+      {/* Main Content Area */}
+      <main className="app-content">
 
       {/* Map View Tab */}
       {activeTab === "map" && (
@@ -351,6 +363,7 @@ export default function App() {
           />
         </div>
       )}
+      </main>
     </div>
   );
 }

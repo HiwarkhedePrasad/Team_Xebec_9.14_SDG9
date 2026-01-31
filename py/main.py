@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
     agent_task = asyncio.create_task(
         run_agent_loop(
             emit_callback=emit_to_clients,
-            tick_interval=0.1,  # Update every 0.1 seconds (10Hz)
+            tick_interval=0.03,  # Update every 0.03 seconds (~33Hz) for smoother movement
         )
     )
     
@@ -195,7 +195,7 @@ async def reset_simulation(sid, data=None):
     agent_task = asyncio.create_task(
         run_agent_loop(
             emit_callback=emit_to_clients,
-            tick_interval=0.1,
+            tick_interval=0.03,
         )
     )
     

@@ -23,6 +23,8 @@ class DroneInfo:
     control_mode: Literal["auto", "manual"] = "auto"
     waypoints: list[tuple[float, float]] = field(default_factory=list)
     waypoint_index: int = 0
+    layer: int = 0  # Scanning layer (0, 1, 2) for 3-layer redundant coverage
+    type: str = "quadcopter"
     
     def to_dict(self) -> dict:
         return {
@@ -36,6 +38,7 @@ class DroneInfo:
             "current_mission": self.current_mission,
             "control_mode": self.control_mode,
             "waypoints": self.waypoints,
+            "layer": self.layer,
         }
 
 

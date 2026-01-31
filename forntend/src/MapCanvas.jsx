@@ -86,14 +86,29 @@ const MapCanvas = ({
         }
       }
 
-      // Draw fog of war
+      // Draw fog of war (3-layer graduated visibility)
       if (layers.fog && scannedCells) {
-        ctx.fillStyle = "rgba(30, 40, 50, 0.7)";
         const cellSize = CANVAS_SIZE / GRID_SIZE;
         for (let y = 0; y < GRID_SIZE; y++) {
           for (let x = 0; x < GRID_SIZE; x++) {
-            if (!scannedCells[y]?.[x]) {
+            const cell = scannedCells[y]?.[x];
+            // Get scan count (0-3) - handle both old and new format
+            const scanCount = typeof cell === 'object' ? (cell?.count || 0) : (cell ? 3 : 0);
+            
+            // Graduated fog based on scan count
+            // 0 scans = full fog, 1 = 50%, 2 = 25%, 3 = no fog
+            if (scanCount < 3) {
+              const opacity = scanCount === 0 ? 0.7 : scanCount === 1 ? 0.45 : 0.2;
+              ctx.fillStyle = `rgba(30, 40, 50, ${opacity})`;
               ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+              
+              // Show scan layer indicator for partially scanned cells
+              if (scanCount > 0) {
+                ctx.fillStyle = "rgba(100, 200, 255, 0.3)";
+                ctx.font = "10px sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText(`${scanCount}/3`, x * cellSize + cellSize/2, y * cellSize + cellSize/2);
+              }
             }
           }
         }
@@ -128,6 +143,17 @@ const MapCanvas = ({
                ctx.beginPath();
                ctx.arc(sx, sy, sSize, 0, Math.PI * 2);
                ctx.fill();
+               
+               // Draw '+' sign (Hospital style)
+               ctx.fillStyle = "white";
+               // Make the cross distinct but proportional
+               const crossSize = Math.max(10, sSize * 0.5); 
+               const thickness = Math.max(3, crossSize * 0.25);
+               
+               // Horizontal bar
+               ctx.fillRect(sx - crossSize/2, sy - thickness/2, crossSize, thickness);
+               // Vertical bar
+               ctx.fillRect(sx - thickness/2, sy - crossSize/2, thickness, crossSize);
              }
            });
         }
@@ -137,11 +163,11 @@ const MapCanvas = ({
           const targetX = drone.x * mapScale;
           const targetY = drone.y * mapScale;
           
-          // Smooth lerp
+          // Smoother, responsive lerp for high-frequency updates (33Hz)
           const id = drone.id;
           const pos = dronePositions.current[id] || { x: targetX, y: targetY };
-          pos.x += (targetX - pos.x) * 0.08;
-          pos.y += (targetY - pos.y) * 0.08;
+          pos.x += (targetX - pos.x) * 0.6;  // Fast response to new data
+          pos.y += (targetY - pos.y) * 0.6;
           dronePositions.current[id] = pos;
 
           // === Draw Path ===
